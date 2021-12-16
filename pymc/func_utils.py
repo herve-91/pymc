@@ -69,6 +69,9 @@ def find_optim_prior(
     The optimized distribution parameters as a dictionary with the parameters'
     name as key and the optimized value as value.
     """
+    # TODO: Add user friendly ValueError for this check
+    assert 0.01 < mass < 0.99
+
     # exit when any parameter is not scalar:
     if np.any(np.asarray(pm_dist.rv_op.ndims_params) != 0):
         raise NotImplementedError(
@@ -76,13 +79,10 @@ def find_optim_prior(
             "Feel free to open a pull request on PyMC repo if you really need this feature."
         )
 
-    # force float64 config
-    aesara.config.floatX = "float64"
     dist_params = aet.vector("dist_params")
     params_to_optim = {
         arg_name: dist_params[i] for arg_name, i in zip(init_guess.keys(), range(len(init_guess)))
     }
-    lower_, upper_ = aet.scalars("lower", "upper")
 
     if fixed_params is not None:
         params_to_optim.update(fixed_params)
@@ -90,8 +90,8 @@ def find_optim_prior(
     dist_ = pm_dist.dist(**params_to_optim)
 
     try:
-        logcdf_lower = pm.logcdf(dist_, lower_)
-        logcdf_upper = pm.logcdf(dist_, upper_)
+        logcdf_lower = pm.logcdf(dist_, pm.floatX(lower))
+        logcdf_upper = pm.logcdf(dist_, pm.floatX(upper))
     except AttributeError:
         raise AttributeError(
             f"You cannot use `find_optim_prior` with {pm_dist} -- it doesn't have a logcdf "
@@ -99,18 +99,18 @@ def find_optim_prior(
             "need it."
         )
 
-    out = pm.math.logdiffexp(logcdf_upper, logcdf_lower) - np.log(mass)
-    logcdf = aesara.function([dist_params, lower_, upper_], out)
+    cdf_error = (pm.math.exp(logcdf_upper) - pm.math.exp(logcdf_lower)) - mass
+    cdf_error_fn = aesara.function([dist_params], cdf_error, allow_input_downcast=True)
 
     try:
-        symb_grad = aet.as_tensor_variable([pm.gradient(o, [dist_params]) for o in out])
-        jac = aesara.function([dist_params, lower_, upper_], symb_grad)
-
+        aesara_jac = pm.gradient(cdf_error, [dist_params])
+        jac = aesara.function([dist_params], aesara_jac, allow_input_downcast=True)
     # when PyMC cannot compute the gradient
+    # TODO: use specific gradient not implemented exception
     except Exception:
         jac = "2-point"
 
-    opt = optimize.least_squares(logcdf, x0=list(init_guess.values()), jac=jac, args=(lower, upper))
+    opt = optimize.least_squares(cdf_error_fn, x0=list(init_guess.values()), jac=jac)
     if not opt.success:
         raise ValueError("Optimization of parameters failed.")
 
